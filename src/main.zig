@@ -3,51 +3,21 @@ const Request = std.http.Server.Request;
 const Response = std.http.Server.Response;
 
 const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+const WS_VERSION = "13";
 
-const HandShakeRequestError = error{
-    no_client_secret,
-    other,
-};
-
-/// verify request and make sure it have the following fileds with the appropriate data eg:
+/// removes any trilling or leading whitespace
 ///
-/// Upgrade: websocket
-/// Connection: Upgrade
-/// Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==
-fn is_valid_req(req: Request) HandShakeRequestError!void {
-    const upgrade = req.headers.getFirstValue("Upgrade") orelse
-        return HandShakeRequestError.other;
-    const connection = req.headers.getFirstValue("Connection") orelse
-        return HandShakeRequestError.other;
-    const websocket_key = req.headers.getFirstValue("Sec-WebSocket-Key") orelse
-        return HandShakeRequestError.no_client_secret;
-
-    std.debug.print(
-        \\
-        \\upgrade: {s}
-        \\connection: {s}
-        \\Sec-WebSocket-Key: {s}
-        \\
-    , .{ upgrade, connection, websocket_key });
-
-    if (std.mem.eql(u8, upgrade, "websocket ") or std.mem.eql(u8, connection, "Upgrade ")) {
-        return HandShakeRequestError.other;
-    }
-}
-
-/// write the handshake response but doesn't send it
-fn perform_handshake(res: *Response) !void {
-    const req = res.request;
-    const client_sec = req.headers.getFirstValue("Sec-WebSocket-Key").?;
-
+/// returns a slice of the passed slice aka you don't own the slice it's just ref from the passed
+/// slice
+fn remove_whitespace(str: []const u8) []const u8 {
     var leading_whitespace: u8 = 0;
     var trailing_whitespace: u8 = 0;
     var last_char: u8 = ' ';
     var i: usize = 0;
 
     // count leading whitespace
-    while (i < client_sec.len) {
-        if (client_sec[i] != ' ') break;
+    while (i < str.len) {
+        if (str[i] != ' ') break;
 
         leading_whitespace += 1;
         last_char = ' ';
@@ -55,14 +25,73 @@ fn perform_handshake(res: *Response) !void {
     }
 
     // count trilling whitespace
-    i = client_sec.len - 1;
+    i = str.len - 1;
     while (i > 0) {
-        if (client_sec[i] != ' ') break;
+        if (str[i] != ' ') break;
 
         trailing_whitespace += 1;
         last_char = ' ';
         i -= 1;
     }
+
+    return str[leading_whitespace .. str.len - trailing_whitespace];
+}
+
+const HandShakeRequestError = error{
+    not_get_request,
+    invalid_http_version,
+    no_host_header,
+    no_upgrade_header,
+    no_connection_header,
+    no_client_secret,
+    no_websocket_version,
+};
+
+/// verifies request and make sure it have the needed fileds with the appropriate data
+/// it doesn't care about the origin header cus it's required from browser clients but not
+/// other non-browser clients
+///
+/// more on the requirements here: [spec section 4.1](https://datatracker.ietf.org/doc/html/rfc6455#section-4.1)
+fn is_valid_req(req: Request) HandShakeRequestError!void {
+    const eql = std.mem.eql;
+    const err = HandShakeRequestError;
+
+    if (req.method != .GET) {
+        return err.not_get_request;
+    }
+
+    if (req.version != .@"HTTP/1.1") {
+        return err.invalid_http_version;
+    }
+
+    // @FIXME should make sure it's a valid URI
+    if (!req.headers.contains("Host")) {
+        return err.no_host_header;
+    }
+
+    if (req.headers.getFirstValue("Upgrade")) |header| {
+        if (!eql(u8, remove_whitespace(header), "websocket")) return err.no_upgrade_header;
+    } else return err.no_upgrade_header;
+
+    if (req.headers.getFirstValue("Connection")) |header| {
+        if (!eql(u8, remove_whitespace(header), "Upgrade")) return err.no_connection_header;
+    } else return err.no_connection_header;
+
+    if (req.headers.getFirstValue("Sec-WebSocket-Key")) |header| {
+        const encoder = std.base64.standard.Encoder;
+        // the spec states it should be a base64 encoding of a random 16-byte value
+        if (remove_whitespace(header).len != encoder.calcSize(16)) return err.no_client_secret;
+    } else return err.no_client_secret;
+
+    if (req.headers.getFirstValue("Sec-WebSocket-Version")) |header| {
+        if (!eql(u8, remove_whitespace(header), WS_VERSION)) return err.no_websocket_version;
+    } else return err.no_websocket_version;
+}
+
+/// write the handshake response but doesn't send it
+fn perform_handshake(res: *Response) !void {
+    const req = res.request;
+    const client_sec = remove_whitespace(req.headers.getFirstValue("Sec-WebSocket-Key").?);
 
     // fixed stack buffer to avoid allocations
     // @FIXME make sure it's always enough
