@@ -6,6 +6,7 @@ const WebSocket = @import("ws").WebSocket;
 fn on_msg(msg: []const u8, ws: *WebSocket) void {
     std.log.debug("{s}", .{msg});
     ws.send(msg) catch unreachable;
+    ws.close("") catch unreachable;
 }
 
 pub fn main() !void {
@@ -41,7 +42,12 @@ pub fn main() !void {
             };
 
             var ws = try WebSocket.init(allocator, &res);
+            // remember to reset the request after this returns
+            // the spec states that the tcp connection must be closed
             try ws.handle(ws_events);
+
+            // close server after websocket connection close
+            // break :outer;
         }
     }
 }

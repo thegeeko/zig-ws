@@ -40,6 +40,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    b.installArtifact(example_exe);
+
     example_exe.addModule("ws", ws_module);
     const run_example = b.addRunArtifact(example_exe);
     const exmaple_step = b.step("run_example", "Run example");

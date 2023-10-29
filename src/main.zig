@@ -220,8 +220,10 @@ const WsFrame = struct {
 pub const WsEvents = struct {
     /// called whenever a message recived
     on_msg: ?fn ([]const u8, ws: *WebSocket) void = null,
-    ///// called after writing the response headers and before sending it
+    /// called after writing the response headers and before sending it
     on_upgrade: ?fn (res: *Response, ws: *WebSocket) void = null,
+    /// called when recived a close frame
+    on_close: ?fn ([]const u8, ws: *WebSocket) void = null,
 };
 
 pub const WebSocket = struct {
@@ -278,10 +280,49 @@ pub const WebSocket = struct {
                     payload[i] = char ^ mask[i % 4];
                 }
 
-                if (events.on_msg) |on_msg|
-                    on_msg(payload, self);
+                switch (frame_header.opcode) {
+                    .text => {
+                        if (events.on_msg) |on_msg|
+                            on_msg(payload, self);
+                    },
+                    .close => {
+                        if (events.on_close) |on_close|
+                            on_close(payload, self);
+
+                        try self.close("");
+                    },
+                    else => {
+                        @panic("unimplemented opcode");
+                    },
+                }
             }
         }
+    }
+
+    pub fn close(self: *Self, msg: []const u8) !void {
+        if (!self.active) return Error.action_without_active_connection;
+
+        if (msg.len > 0) @panic("message is too big");
+
+        var reply = WsFrameHeader{
+            .size = @truncate(msg.len),
+            .opcode = .close,
+        };
+
+        var header = std.mem.asBytes(&reply);
+
+        var data_frame = try self.allocator.alloc(
+            u8,
+            WsFrameHeader.header_size + msg.len,
+        );
+        defer self.allocator.free(data_frame);
+
+        @memcpy(data_frame[0..2], header);
+        @memcpy(data_frame[2 .. msg.len + 2], msg);
+
+        _ = try self.stream.write(data_frame);
+
+        self.active = false;
     }
 
     /// send unmasked message as the server should according to the spec
