@@ -29,6 +29,22 @@ pub fn build(b: *std.Build) void {
     // running `zig build`).
     b.installArtifact(lib);
 
+    const ws_module = b.addModule("ws", .{
+        .source_file = .{ .path = "src/main.zig" },
+    });
+
+    const example_exe = b.addExecutable(.{
+        .name = "example",
+        .root_source_file = .{ .path = "example/simple_server.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+
+    example_exe.addModule("ws", ws_module);
+    const run_example = b.addRunArtifact(example_exe);
+    const exmaple_step = b.step("run_example", "Run example");
+    exmaple_step.dependOn(&run_example.step);
+
     // Creates a step for unit testing. This only builds the test executable
     // but does not run it.
     const main_tests = b.addTest(.{

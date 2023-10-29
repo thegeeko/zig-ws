@@ -52,7 +52,7 @@ const HandShakeRequestError = error{
 /// other non-browser clients
 ///
 /// more on the requirements here: [spec section 4.1](https://datatracker.ietf.org/doc/html/rfc6455#section-4.1)
-fn is_valid_req(req: Request) HandShakeRequestError!void {
+fn is_valid_req(req: *const Request) HandShakeRequestError!void {
     const eql = std.mem.eql;
     const err = HandShakeRequestError;
 
@@ -93,8 +93,12 @@ fn write_handshake(res: *Response) !void {
     const req = res.request;
     const client_sec = remove_whitespace(req.headers.getFirstValue("Sec-WebSocket-Key").?);
 
-    // fixed stack buffer to avoid allocations
-    // @FIXME make sure it's always enough
+    // 512byte should be more than enough since it's the base64
+    // encoding of a 16-byte
+    //
+    // "The value of this header field MUST be a
+    //  nonce consisting of a randomly selected 16-byte value that has
+    //  been base64-encoded"
     var buf: [512]u8 = undefined;
     const total_len = client_sec.len + WS_GUID.len;
     var concat_sec: []u8 = buf[0..total_len];
@@ -110,11 +114,9 @@ fn write_handshake(res: *Response) !void {
     const basae64_output_size = encoder.calcSize(sha1_output.len);
 
     // reusing the concat buffer
-    @memset(&buf, 0);
     var base64_output = buf[0..basae64_output_size];
     _ = encoder.encode(base64_output, &sha1_output);
 
-    std.debug.print("\nClient secret: {s}", .{base64_output});
     res.status = .switching_protocols;
     res.transfer_encoding = .{ .content_length = 0 };
     try res.headers.append("Upgrade", "websocket");
@@ -123,6 +125,7 @@ fn write_handshake(res: *Response) !void {
     try res.do();
 }
 
+/// op codes according to the [spec](https://datatracker.ietf.org/doc/html/rfc6455#section-11.8)
 pub const Opcode = enum(u4) {
     op_continue = 0x0,
     text = 0x1,
@@ -161,7 +164,7 @@ const WsFrameHeader = packed struct {
 
     // second byte
     size: u7,
-    mask: bool,
+    mask: bool = false,
 
     const mask_size = 4;
     const header_size = 2;
@@ -214,115 +217,100 @@ const WsFrame = struct {
     data: []const u8,
 };
 
+pub const WsEvents = struct {
+    /// called whenever a message recived
+    on_msg: ?fn ([]const u8, ws: *WebSocket) void = null,
+    ///// called after writing the response headers and before sending it
+    on_upgrade: ?fn (res: *Response, ws: *WebSocket) void = null,
+};
+
+pub const WebSocket = struct {
+    const Self = @This();
+    const Error = error{
+        action_without_active_connection,
+    };
+
+    allocator: std.mem.Allocator,
+    res: *Response,
+    stream: *std.net.Stream,
+    active: bool = false,
+
+    /// init the object and checks if the request is a valid handshake request
+    /// the request is data is included in the response object
+    pub fn init(allocator: std.mem.Allocator, res: *Response) !Self {
+        try is_valid_req(&res.request);
+
+        var ws = Self{
+            .allocator = allocator,
+            .res = res,
+            .stream = &res.connection.stream,
+        };
+
+        return ws;
+    }
+
+    /// handle handshaking and proccess data frames
+    /// don't use this inside WsEvents
+    pub fn handle(self: *Self, comptime events: WsEvents) !void {
+        try write_handshake(self.res);
+
+        if (events.on_upgrade) |on_upgrade|
+            on_upgrade(self.res, self);
+
+        try self.res.finish();
+
+        self.active = true;
+        while (self.active) {
+            var stream_reader = self.stream.reader();
+
+            const frame_header = try WsFrameHeader.read_from(&stream_reader);
+            if (frame_header.is_payload_size_defined_in_header()) {
+                var mask: [WsFrameHeader.mask_size]u8 = undefined;
+                _ = try stream_reader.read(&mask);
+
+                const payload_size = try frame_header.payload_size();
+                var payload = try self.allocator.alloc(u8, payload_size);
+                defer self.allocator.free(payload);
+
+                _ = try stream_reader.read(payload);
+                // unmasking according to the spec
+                for (0.., payload) |i, char| {
+                    payload[i] = char ^ mask[i % 4];
+                }
+
+                if (events.on_msg) |on_msg|
+                    on_msg(payload, self);
+            }
+        }
+    }
+
+    /// send unmasked message as the server should according to the spec
+    pub fn send(self: *Self, msg: []const u8) !void {
+        if (!self.active) return Error.action_without_active_connection;
+
+        if (msg.len > 125) @panic("message is too big");
+
+        var reply = WsFrameHeader{
+            .size = @truncate(msg.len),
+            .opcode = .text,
+        };
+
+        var header = std.mem.asBytes(&reply);
+
+        var data_frame = try self.allocator.alloc(
+            u8,
+            WsFrameHeader.header_size + msg.len,
+        );
+        defer self.allocator.free(data_frame);
+
+        @memcpy(data_frame[0..2], header);
+        @memcpy(data_frame[2 .. msg.len + 2], msg);
+
+        _ = try self.stream.write(data_frame);
+    }
+};
+
 test "hand shake" {
     const testing = std.testing;
     testing.log_level = .debug;
-
-    std.debug.print("\nserver started in port: {}", .{3000});
-
-    var ta = testing.allocator_instance;
-    const alloc = ta.allocator();
-    defer {
-        const check = ta.deinit();
-        if (check == .leak) {
-            @panic("Memory Leak");
-        }
-    }
-
-    var server = std.http.Server.init(alloc, .{ .reuse_address = true });
-
-    const addr = try std.net.Address.parseIp("127.0.0.1", 3000);
-    try server.listen(addr);
-
-    var conn = false;
-    var ws_res: Response = undefined;
-    defer ws_res.deinit();
-    outer: while (!conn) {
-        var res = try server.accept(.{
-            .allocator = alloc,
-        });
-
-        while (res.reset() != .closing) {
-            res.wait() catch |err| switch (err) {
-                error.HttpHeadersInvalid => continue :outer,
-                error.EndOfStream => continue,
-                else => return err,
-            };
-
-            std.debug.print(
-                \\
-                \\Request:
-                \\   |-Method: {s}
-                \\   |-HTTP Version: {s}
-                \\   |-Target(route): {s}
-            , .{
-                @tagName(res.request.method),
-                @tagName(res.request.version),
-                res.request.target,
-            });
-
-            try is_valid_req(res.request);
-            try write_handshake(&res);
-            try res.finish();
-            conn = true;
-            ws_res = res;
-            continue :outer;
-        }
-    }
-
-    var buf: [2048]u8 = undefined;
-    while (true) {
-        var stream_reader = ws_res.connection.stream.reader();
-        var stream_writer = ws_res.connection.stream.writer();
-        _ = stream_writer;
-
-        const frame_header = try WsFrameHeader.read_from(&stream_reader);
-        std.debug.print("\nHeader: {}", .{frame_header});
-
-        if (frame_header.is_payload_size_defined_in_header()) {
-            var mask: [WsFrameHeader.mask_size]u8 = undefined;
-            _ = try stream_reader.read(&mask);
-
-            const payload_size = try frame_header.payload_size();
-            var payload = buf[0..payload_size];
-            _ = try stream_reader.read(payload);
-
-            for (0.., payload) |i, char| {
-                payload[i] = char ^ mask[i % 4];
-            }
-
-            std.debug.print("\nMessage: {s}", .{payload});
-
-            var reply = WsFrameHeader{
-                .mask = false,
-                .rsv1 = 0,
-                .rsv2 = 0,
-                .rsv3 = 0,
-                .size = 16,
-                .final = true,
-                .opcode = .text,
-            };
-
-            var header = std.mem.asBytes(&reply);
-            std.debug.print("{any}", .{header});
-
-            @memcpy(buf[0..2], header);
-            @memcpy(buf[2..18], "Hello, World! :3");
-
-            _ = try ws_res.connection.write(buf[0..18]);
-        }
-
-        // var mask_key: ?[4]u8 = null;
-        // if (frame_header.mask) {
-        //     _ = try stream_reader.read(&mask_key.?);
-        //     std.debug.print("{any}", .{mask_key.?});
-        // }
-
-        // if (frame_header.payload_size <= 125) {
-        //     var payload = buf[0..frame_header.payload_size];
-        //     var payload_size = try stream_reader.read(payload);
-        //     std.debug.print("\npayload {}({}): {s}\n", .{ payload_size, @as(u8, frame_header.payload_size), payload });
-        //     std.debug.assert(payload_size == frame_header.payload_size);
-        // }
-    }
 }
