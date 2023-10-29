@@ -89,7 +89,7 @@ fn is_valid_req(req: Request) HandShakeRequestError!void {
 }
 
 /// write the handshake response but doesn't send it
-fn perform_handshake(res: *Response) !void {
+fn write_handshake(res: *Response) !void {
     const req = res.request;
     const client_sec = remove_whitespace(req.headers.getFirstValue("Sec-WebSocket-Key").?);
 
@@ -114,7 +114,7 @@ fn perform_handshake(res: *Response) !void {
     var base64_output = buf[0..basae64_output_size];
     _ = encoder.encode(base64_output, &sha1_output);
 
-    std.debug.print("{s}", .{base64_output});
+    std.debug.print("\nClient secret: {s}", .{base64_output});
     res.status = .switching_protocols;
     res.transfer_encoding = .{ .content_length = 0 };
     try res.headers.append("Upgrade", "websocket");
@@ -122,6 +122,97 @@ fn perform_handshake(res: *Response) !void {
     try res.headers.append("Sec-WebSocket-Accept", base64_output);
     try res.do();
 }
+
+pub const Opcode = enum(u4) {
+    op_continue = 0x0,
+    text = 0x1,
+    binary = 0x2,
+    rsv3 = 0x3,
+    rsv4 = 0x4,
+    rsv5 = 0x5,
+    rsv6 = 0x6,
+    rsv7 = 0x7,
+    close = 0x8,
+    ping = 0x9,
+    pong = 0xA,
+    rsvB = 0xB,
+    rsvC = 0xC,
+    rsvD = 0xD,
+    rsvE = 0xE,
+    rsvF = 0xF,
+
+    pub fn is_control(opcode: Opcode) bool {
+        return @intFromEnum(opcode) & 0x8 != 0;
+    }
+};
+
+const WsFrameHeader = packed struct {
+    const Error = error{
+        length_not_defined_in_header,
+    };
+    const Self = @This();
+
+    // first byte
+    opcode: Opcode,
+    rsv3: u1 = 0,
+    rsv2: u1 = 0,
+    rsv1: u1 = 0,
+    final: bool = true,
+
+    // second byte
+    size: u7,
+    mask: bool,
+
+    const mask_size = 4;
+    const header_size = 2;
+    const max_frame_size = mask_size + header_size + @sizeOf(u64);
+
+    pub fn is_payload_size_defined_in_header(self: *const Self) bool {
+        return switch (self.size) {
+            0...125 => true,
+            else => false,
+        };
+    }
+
+    pub fn payload_size(self: *const Self) !usize {
+        return switch (self.size) {
+            0...125 => self.size,
+            else => Error.length_not_defined_in_header,
+        };
+    }
+
+    pub fn frame_size(self: *const Self) usize {
+        var size: usize = 0;
+        size += header_size;
+
+        size += switch (self.size) {
+            0...125 => 0,
+            126...0xFFFF => @sizeOf(u16),
+            else => @sizeOf(u64),
+        };
+
+        if (self.mask) size += mask_size;
+
+        return size;
+    }
+
+    pub fn read_from(reader: *std.net.Stream.Reader) !Self {
+        var buf: [header_size]u8 = undefined;
+        _ = try reader.read(&buf);
+        const frame_header = @as(*align(1) const WsFrameHeader, @ptrCast(&buf)).*;
+        return frame_header;
+    }
+
+    comptime {
+        std.debug.assert(@sizeOf(@This()) == 2);
+    }
+};
+
+const WsFrame = struct {
+    frame_header: WsFrameHeader,
+    mask: [4]u8,
+    data: []const u8,
+};
 
 test "hand shake" {
     const testing = std.testing;
@@ -143,11 +234,13 @@ test "hand shake" {
     const addr = try std.net.Address.parseIp("127.0.0.1", 3000);
     try server.listen(addr);
 
-    outer: while (true) {
+    var conn = false;
+    var ws_res: Response = undefined;
+    defer ws_res.deinit();
+    outer: while (!conn) {
         var res = try server.accept(.{
             .allocator = alloc,
         });
-        defer res.deinit();
 
         while (res.reset() != .closing) {
             res.wait() catch |err| switch (err) {
@@ -156,15 +249,80 @@ test "hand shake" {
                 else => return err,
             };
 
-            std.debug.print("\n{s} {s} {s}", .{
+            std.debug.print(
+                \\
+                \\Request:
+                \\   |-Method: {s}
+                \\   |-HTTP Version: {s}
+                \\   |-Target(route): {s}
+            , .{
                 @tagName(res.request.method),
                 @tagName(res.request.version),
                 res.request.target,
             });
 
             try is_valid_req(res.request);
-            try perform_handshake(&res);
+            try write_handshake(&res);
             try res.finish();
+            conn = true;
+            ws_res = res;
+            continue :outer;
         }
+    }
+
+    var buf: [2048]u8 = undefined;
+    while (true) {
+        var stream_reader = ws_res.connection.stream.reader();
+        var stream_writer = ws_res.connection.stream.writer();
+        _ = stream_writer;
+
+        const frame_header = try WsFrameHeader.read_from(&stream_reader);
+        std.debug.print("\nHeader: {}", .{frame_header});
+
+        if (frame_header.is_payload_size_defined_in_header()) {
+            var mask: [WsFrameHeader.mask_size]u8 = undefined;
+            _ = try stream_reader.read(&mask);
+
+            const payload_size = try frame_header.payload_size();
+            var payload = buf[0..payload_size];
+            _ = try stream_reader.read(payload);
+
+            for (0.., payload) |i, char| {
+                payload[i] = char ^ mask[i % 4];
+            }
+
+            std.debug.print("\nMessage: {s}", .{payload});
+
+            var reply = WsFrameHeader{
+                .mask = false,
+                .rsv1 = 0,
+                .rsv2 = 0,
+                .rsv3 = 0,
+                .size = 16,
+                .final = true,
+                .opcode = .text,
+            };
+
+            var header = std.mem.asBytes(&reply);
+            std.debug.print("{any}", .{header});
+
+            @memcpy(buf[0..2], header);
+            @memcpy(buf[2..18], "Hello, World! :3");
+
+            _ = try ws_res.connection.write(buf[0..18]);
+        }
+
+        // var mask_key: ?[4]u8 = null;
+        // if (frame_header.mask) {
+        //     _ = try stream_reader.read(&mask_key.?);
+        //     std.debug.print("{any}", .{mask_key.?});
+        // }
+
+        // if (frame_header.payload_size <= 125) {
+        //     var payload = buf[0..frame_header.payload_size];
+        //     var payload_size = try stream_reader.read(payload);
+        //     std.debug.print("\npayload {}({}): {s}\n", .{ payload_size, @as(u8, frame_header.payload_size), payload });
+        //     std.debug.assert(payload_size == frame_header.payload_size);
+        // }
     }
 }
