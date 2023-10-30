@@ -37,55 +37,54 @@ fn remove_whitespace(str: []const u8) []const u8 {
     return str[leading_whitespace .. str.len - trailing_whitespace];
 }
 
-const HandShakeRequestError = error{
-    not_get_request,
-    invalid_http_version,
-    no_host_header,
-    no_upgrade_header,
-    no_connection_header,
-    no_client_secret,
-    no_websocket_version,
-};
-
 /// verifies request and make sure it have the needed fileds with the appropriate data
 /// it doesn't care about the origin header cus it's required from browser clients but not
 /// other non-browser clients
 ///
 /// more on the requirements here: [spec section 4.1](https://datatracker.ietf.org/doc/html/rfc6455#section-4.1)
-fn is_valid_req(req: *const Request) HandShakeRequestError!void {
+fn is_valid_req(req: *const Request) !void {
+    const Error = error{
+        not_get_request,
+        invalid_http_version,
+        no_host_header,
+        no_upgrade_header,
+        no_connection_header,
+        no_client_secret,
+        no_websocket_version,
+    };
+
     const eql = std.mem.eql;
-    const err = HandShakeRequestError;
 
     if (req.method != .GET) {
-        return err.not_get_request;
+        return Error.not_get_request;
     }
 
     if (req.version != .@"HTTP/1.1") {
-        return err.invalid_http_version;
+        return Error.invalid_http_version;
     }
 
     // @FIXME should make sure it's a valid URI
     if (!req.headers.contains("Host")) {
-        return err.no_host_header;
+        return Error.no_host_header;
     }
 
     if (req.headers.getFirstValue("Upgrade")) |header| {
-        if (!eql(u8, remove_whitespace(header), "websocket")) return err.no_upgrade_header;
-    } else return err.no_upgrade_header;
+        if (!eql(u8, remove_whitespace(header), "websocket")) return Error.no_upgrade_header;
+    } else return Error.no_upgrade_header;
 
     if (req.headers.getFirstValue("Connection")) |header| {
-        if (!eql(u8, remove_whitespace(header), "Upgrade")) return err.no_connection_header;
-    } else return err.no_connection_header;
+        if (!eql(u8, remove_whitespace(header), "Upgrade")) return Error.no_connection_header;
+    } else return Error.no_connection_header;
 
     if (req.headers.getFirstValue("Sec-WebSocket-Key")) |header| {
         const encoder = std.base64.standard.Encoder;
         // the spec states it should be a base64 encoding of a random 16-byte value
-        if (remove_whitespace(header).len != encoder.calcSize(16)) return err.no_client_secret;
-    } else return err.no_client_secret;
+        if (remove_whitespace(header).len != encoder.calcSize(16)) return Error.no_client_secret;
+    } else return Error.no_client_secret;
 
     if (req.headers.getFirstValue("Sec-WebSocket-Version")) |header| {
-        if (!eql(u8, remove_whitespace(header), WS_VERSION)) return err.no_websocket_version;
-    } else return err.no_websocket_version;
+        if (!eql(u8, remove_whitespace(header), WS_VERSION)) return Error.no_websocket_version;
+    } else return Error.no_websocket_version;
 }
 
 /// write the handshake response but doesn't send it
@@ -150,9 +149,6 @@ pub const Opcode = enum(u4) {
 };
 
 const WsFrameHeader = packed struct {
-    const Error = error{
-        length_not_defined_in_header,
-    };
     const Self = @This();
 
     // first byte
@@ -164,23 +160,17 @@ const WsFrameHeader = packed struct {
 
     // second byte
     size: u7,
-    mask: bool = false,
+    masked: bool = false,
 
     const mask_size = 4;
     const header_size = 2;
     const max_frame_size = mask_size + header_size + @sizeOf(u64);
 
-    pub fn is_payload_size_defined_in_header(self: *const Self) bool {
+    pub fn payload_size_bytes_count(self: *const Self) usize {
         return switch (self.size) {
-            0...125 => true,
-            else => false,
-        };
-    }
-
-    pub fn payload_size(self: *const Self) !usize {
-        return switch (self.size) {
-            0...125 => self.size,
-            else => Error.length_not_defined_in_header,
+            0...125 => 0,
+            126 => @sizeOf(u16),
+            127 => @sizeOf(u64),
         };
     }
 
@@ -190,23 +180,17 @@ const WsFrameHeader = packed struct {
 
         size += switch (self.size) {
             0...125 => 0,
-            126...0xFFFF => @sizeOf(u16),
-            else => @sizeOf(u64),
+            126 => @sizeOf(u16),
+            127 => @sizeOf(u64),
         };
 
-        if (self.mask) size += mask_size;
+        if (self.masked) size += mask_size;
 
         return size;
     }
 
-    pub fn read_from(reader: *std.net.Stream.Reader) !Self {
-        var buf: [header_size]u8 = undefined;
-        _ = try reader.read(&buf);
-        const frame_header = @as(*align(1) const WsFrameHeader, @ptrCast(&buf)).*;
-        return frame_header;
-    }
-
     comptime {
+        // making sure the struct is always 2 bytes
         std.debug.assert(@sizeOf(@This()) == 2);
     }
 };
@@ -265,36 +249,64 @@ pub const WebSocket = struct {
         while (self.active) {
             var stream_reader = self.stream.reader();
 
-            const frame_header = try WsFrameHeader.read_from(&stream_reader);
-            if (frame_header.is_payload_size_defined_in_header()) {
-                var mask: [WsFrameHeader.mask_size]u8 = undefined;
-                _ = try stream_reader.read(&mask);
+            const frame_header = try stream_reader.readStruct(WsFrameHeader);
 
-                const payload_size = try frame_header.payload_size();
-                var payload = try self.allocator.alloc(u8, payload_size);
-                defer self.allocator.free(payload);
+            var payload_size: u64 = 0;
+            const payload_size_bytes_count = frame_header.payload_size_bytes_count();
 
-                _ = try stream_reader.read(payload);
+            if (payload_size_bytes_count == 0) {
+                payload_size = frame_header.size;
+            } else {
+                var buf: [@sizeOf(u64)]u8 = undefined;
+                var sized_buf = buf[0..payload_size_bytes_count];
+                _ = try stream_reader.read(sized_buf);
+
+                if (payload_size_bytes_count == @sizeOf(u16)) {
+                    payload_size =
+                        @as(u16, @intCast(sized_buf[1])) | @as(u16, @intCast(sized_buf[0])) << 8;
+                } else {
+                    payload_size =
+                        @as(u64, @intCast(sized_buf[7])) |
+                        @as(u64, @intCast(sized_buf[6])) << 8 |
+                        @as(u64, @intCast(sized_buf[5])) << 16 |
+                        @as(u64, @intCast(sized_buf[4])) << 24 |
+                        @as(u64, @intCast(sized_buf[3])) << 32 |
+                        @as(u64, @intCast(sized_buf[2])) << 40 |
+                        @as(u64, @intCast(sized_buf[1])) << 48 |
+                        @as(u64, @intCast(sized_buf[0])) << 56;
+                }
+            }
+
+            var mask: [WsFrameHeader.mask_size]u8 = undefined;
+            if (frame_header.masked)
+                _ = try stream_reader.readAtLeast(&mask, WsFrameHeader.mask_size);
+
+            var payload = try self.allocator.alloc(u8, payload_size);
+            defer self.allocator.free(payload);
+
+            _ = try stream_reader.readAtLeast(payload, payload_size);
+
+            if (frame_header.masked) {
                 // unmasking according to the spec
                 for (0.., payload) |i, char| {
                     payload[i] = char ^ mask[i % 4];
                 }
+            }
 
-                switch (frame_header.opcode) {
-                    .text => {
-                        if (events.on_msg) |on_msg|
-                            on_msg(payload, self);
-                    },
-                    .close => {
-                        if (events.on_close) |on_close|
-                            on_close(payload, self);
+            switch (frame_header.opcode) {
+                .text => {
+                    if (events.on_msg) |on_msg|
+                        on_msg(payload, self);
+                },
+                .close => {
+                    if (events.on_close) |on_close|
+                        on_close(payload, self);
 
-                        try self.close("");
-                    },
-                    else => {
-                        @panic("unimplemented opcode");
-                    },
-                }
+                    try self.close(payload);
+                },
+                else => {
+                    @panic("unimplemented opcode");
+                },
             }
         }
     }
