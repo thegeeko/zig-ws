@@ -174,21 +174,6 @@ const WsFrameHeader = packed struct {
         };
     }
 
-    pub fn frame_size(self: *const Self) usize {
-        var size: usize = 0;
-        size += header_size;
-
-        size += switch (self.size) {
-            0...125 => 0,
-            126 => @sizeOf(u16),
-            127 => @sizeOf(u64),
-        };
-
-        if (self.masked) size += mask_size;
-
-        return size;
-    }
-
     comptime {
         // making sure the struct is always 2 bytes
         std.debug.assert(@sizeOf(@This()) == 2);
@@ -314,26 +299,7 @@ pub const WebSocket = struct {
     pub fn close(self: *Self, msg: []const u8) !void {
         if (!self.active) return Error.action_without_active_connection;
 
-        if (msg.len > 0) @panic("message is too big");
-
-        var reply = WsFrameHeader{
-            .size = @truncate(msg.len),
-            .opcode = .close,
-        };
-
-        var header = std.mem.asBytes(&reply);
-
-        var data_frame = try self.allocator.alloc(
-            u8,
-            WsFrameHeader.header_size + msg.len,
-        );
-        defer self.allocator.free(data_frame);
-
-        @memcpy(data_frame[0..2], header);
-        @memcpy(data_frame[2 .. msg.len + 2], msg);
-
-        _ = try self.stream.write(data_frame);
-
+        try self.write(.close, msg);
         self.active = false;
     }
 
@@ -341,25 +307,61 @@ pub const WebSocket = struct {
     pub fn send(self: *Self, msg: []const u8) !void {
         if (!self.active) return Error.action_without_active_connection;
 
-        if (msg.len > 125) @panic("message is too big");
+        try self.write(.text, msg);
+    }
 
-        var reply = WsFrameHeader{
-            .size = @truncate(msg.len),
-            .opcode = .text,
+    fn write(self: *Self, opcode: Opcode, payload: []const u8) !void {
+        var total_size: usize = 0;
+
+        var frame_header_size: u7 = switch (payload.len) {
+            0...125 => @truncate(payload.len),
+            126...65535 => 126,
+            else => 127,
         };
 
-        var header = std.mem.asBytes(&reply);
+        total_size += WsFrameHeader.header_size;
+        var reply = WsFrameHeader{
+            .size = frame_header_size,
+            .opcode = opcode,
+        };
 
-        var data_frame = try self.allocator.alloc(
-            u8,
-            WsFrameHeader.header_size + msg.len,
-        );
+        var payload_size_bytes = reply.payload_size_bytes_count();
+        total_size += payload_size_bytes;
+        total_size += payload.len;
+
+        var data_frame = try self.allocator.alloc(u8, total_size);
         defer self.allocator.free(data_frame);
 
-        @memcpy(data_frame[0..2], header);
-        @memcpy(data_frame[2 .. msg.len + 2], msg);
+        var i: usize = 0;
+        var header = std.mem.asBytes(&reply);
+        @memcpy(data_frame[i..WsFrameHeader.header_size], header);
+        i += WsFrameHeader.header_size;
 
-        _ = try self.stream.write(data_frame);
+        if (payload_size_bytes == @sizeOf(u16)) {
+            const size: u16 = @truncate(payload.len);
+            // swap endiannes for the network
+            const swapped_size = (size >> 8) | (size << 8);
+            @memcpy(
+                data_frame[i .. i + @sizeOf(u16)],
+                std.mem.asBytes(&swapped_size),
+            );
+            i += @sizeOf(u16);
+        } else if (payload_size_bytes == @sizeOf(u64)) {
+            const size: u64 = @truncate(payload.len);
+            // swap endiannes for the network
+            var swapped_size = size;
+            swapped_size = (swapped_size & 0x00000000ffffffff) << 32 | (swapped_size & 0xffffffff00000000) >> 32;
+            swapped_size = (swapped_size & 0x0000ffff0000ffff) << 16 | (swapped_size & 0xffff0000ffff0000) >> 16;
+            swapped_size = (swapped_size & 0x00ff00ff00ff00ff) << 8 | (swapped_size & 0xff00ff00ff00ff00) >> 8;
+            @memcpy(
+                data_frame[WsFrameHeader.header_size .. WsFrameHeader.header_size + @sizeOf(u64)],
+                std.mem.asBytes(&swapped_size),
+            );
+            i += @sizeOf(u64);
+        }
+
+        @memcpy(data_frame[i .. i + payload.len], payload);
+        _ = try self.stream.writeAll(data_frame);
     }
 };
 
