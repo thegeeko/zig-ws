@@ -6,6 +6,7 @@ const WebSocket = @import("ws").WebSocket;
 fn on_msg(msg: []const u8, ws: *WebSocket) void {
     std.log.debug("msg: ({}):{s}", .{ msg.len, msg });
     ws.send(msg) catch unreachable;
+    ws.ping("test") catch unreachable;
 }
 
 pub fn main() !void {

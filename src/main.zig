@@ -193,6 +193,10 @@ pub const WsEvents = struct {
     on_upgrade: ?fn (res: *Response, ws: *WebSocket) void = null,
     /// called when recived a close frame
     on_close: ?fn ([]const u8, ws: *WebSocket) void = null,
+    /// called when pinged
+    on_ping: ?fn ([]const u8, ws: *WebSocket) void = null,
+    /// called when ponged
+    on_pong: ?fn ([]const u8, ws: *WebSocket) void = null,
 };
 
 pub const WebSocket = struct {
@@ -279,7 +283,7 @@ pub const WebSocket = struct {
             }
 
             switch (frame_header.opcode) {
-                .text => {
+                .text, .binary => {
                     if (events.on_msg) |on_msg|
                         on_msg(payload, self);
                 },
@@ -288,6 +292,16 @@ pub const WebSocket = struct {
                         on_close(payload, self);
 
                     try self.close(payload);
+                },
+                .ping => {
+                    try self.pong(payload);
+
+                    if (events.on_ping) |on_ping|
+                        on_ping(payload, self);
+                },
+                .pong => {
+                    if (events.on_pong) |on_pong|
+                        on_pong(payload, self);
                 },
                 else => {
                     @panic("unimplemented opcode");
@@ -308,6 +322,18 @@ pub const WebSocket = struct {
         if (!self.active) return Error.action_without_active_connection;
 
         try self.write(.text, msg);
+    }
+
+    pub fn ping(self: *Self, msg: []const u8) !void {
+        if (!self.active) return Error.action_without_active_connection;
+
+        try self.write(.ping, msg);
+    }
+
+    pub fn pong(self: *Self, msg: []const u8) !void {
+        if (!self.active) return Error.action_without_active_connection;
+
+        try self.write(.pong, msg);
     }
 
     fn write(self: *Self, opcode: Opcode, payload: []const u8) !void {
