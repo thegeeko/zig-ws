@@ -1,6 +1,6 @@
 # ZIG-WS:
 
-a server implementaion of [RFC6455](https://datatracker.ietf.org/doc/html/rfc6455) in Zig it passes the whole autobahn test suite you can see the report inside the support folder
+a server implementaion of [RFC6455](https://datatracker.ietf.org/doc/html/rfc6455) in Zig it passes the whole [autobahn](https://github.com/crossbario/autobahn-testsuite) test suite you can see the report inside the support folder
 
 ## Test localy:
 
