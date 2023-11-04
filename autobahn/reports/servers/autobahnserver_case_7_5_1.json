@@ -1,0 +1,121 @@
+{
+   "agent": "AutobahnServer",
+   "behavior": "OK",
+   "behaviorClose": "OK",
+   "case": 222,
+   "closedByMe": true,
+   "createStats": true,
+   "createWirelog": true,
+   "description": "Send a close frame with invalid UTF8 payload",
+   "droppedByMe": false,
+   "duration": 0,
+   "expectation": "Clean close with protocol error or invalid utf8 code or dropped TCP.",
+   "expected": {
+      "OK": []
+   },
+   "expectedClose": {
+      "closeCode": [
+         1002,
+         1007
+      ],
+      "closedByMe": true,
+      "requireClean": false
+   },
+   "failedByMe": false,
+   "httpRequest": "GET / HTTP/1.1\r\nUser-Agent: AutobahnTestSuite/0.8.2-0.10.9\r\nHost: 127.0.0.1:3000\r\nUpgrade: WebSocket\r\nConnection: Upgrade\r\nPragma: no-cache\r\nCache-Control: no-cache\r\nSec-WebSocket-Key: YdTJRNg9afFRBf6svci1Wg==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+   "httpResponse": "HTTP/1.1 101 Switching Protocols\r\nServer: zig (std.http)\r\nContent-Length: 0\r\nupgrade: websocket\r\nconnection: Upgrade\r\nsec-websocket-accept: g1JqY1cNGDSGnRs9ihwOyB4zp3Q=\r\n\r\n",
+   "id": "7.5.1",
+   "isServer": false,
+   "localCloseCode": 1000,
+   "localCloseReason": "cebae1bdb9cf83cebcceb5eda080656469746564",
+   "received": [],
+   "remoteCloseCode": 1002,
+   "remoteCloseReason": "invalid utf-8, close frames payload must be valid utf-8",
+   "reportCompressionRatio": false,
+   "reportTime": false,
+   "result": "Actual events match at least one expected.",
+   "resultClose": "Connection was properly closed",
+   "rxFrameStats": {
+      "8": 1
+   },
+   "rxOctetStats": {
+      "59": 1,
+      "172": 1
+   },
+   "started": "2023-11-04T08:57:15.740Z",
+   "trafficStats": null,
+   "txFrameStats": {
+      "8": 1
+   },
+   "txOctetStats": {
+      "28": 1,
+      "240": 1
+   },
+   "wasClean": true,
+   "wasCloseHandshakeTimeout": false,
+   "wasNotCleanReason": null,
+   "wasOpenHandshakeTimeout": false,
+   "wasServerConnectionDropTimeout": false,
+   "wirelog": [
+      [
+         "TO",
+         [
+            240,
+            "474554202f20485454502f312e310d0a557365722d4167656e743a204175746f6261686e5465737453756974652f302e382e322d302e31302e390d0a486f7374 ..."
+         ],
+         false
+      ],
+      [
+         "RO",
+         [
+            172,
+            "485454502f312e312031303120537769746368696e672050726f746f636f6c730d0a5365727665723a207a696720287374642e68747470290d0a436f6e74656e ..."
+         ]
+      ],
+      [
+         "TF",
+         [
+            22,
+            "0x03e8cebae1bdb9cf83cebcceb5eda080656469746564"
+         ],
+         8,
+         true,
+         0,
+         "b75d0761",
+         null,
+         null,
+         false
+      ],
+      [
+         "TO",
+         [
+            28,
+            "8896b75d0761b4b5c9db56e0beae3493bbaf02b0a7e1d2396e15d239"
+         ],
+         false
+      ],
+      [
+         "KL",
+         1
+      ],
+      [
+         "RO",
+         [
+            59,
+            "883903ea696e76616c6964207574662d382c20636c6f7365206672616d6573207061796c6f6164206d7573742062652076616c6964207574662d38"
+         ]
+      ],
+      [
+         "RF",
+         [
+            57,
+            "0x03ea696e76616c6964207574662d382c20636c6f7365206672616d6573207061796c6f6164206d7573742062652076616c6964207574662d38"
+         ],
+         8,
+         true,
+         0,
+         false,
+         null
+      ]
+   ]
+}
