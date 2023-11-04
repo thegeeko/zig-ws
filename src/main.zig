@@ -319,6 +319,9 @@ pub const WebSocket = struct {
 
     /// init the object and checks if the request is a valid handshake request
     /// the request is data is included in the response object
+    ///
+    /// takes the ownership of the res object
+    /// will handle cleaning the response object and closing the TCP conn
     pub fn init(allocator: std.mem.Allocator, res: *Response) !Self {
         // try is_valid_req(&res.request);
 
@@ -338,7 +341,6 @@ pub const WebSocket = struct {
 
     /// handle handshaking and proccess data frames
     /// don't use this inside WsEvents callbacks
-    /// will handle cleaning the response object and closing the TCP conn
     pub fn handle(self: *Self, comptime events: WsEvents) !void {
         try write_handshake(self.res);
 

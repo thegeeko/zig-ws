@@ -1,3 +1,42 @@
+# ZIG-WS:
+
+a server implementaion of [RFC6455](https://datatracker.ietf.org/doc/html/rfc6455) in Zig it passes the whole autobahn test suite you can see the report inside the support folder
+
+## Test localy:
+
+to start a simple echo server:
+
+```bash
+# clone repo
+git clone https://github.com/thegeeko/zig-ws && cd zig-ws
+
+# start the server
+zig build run_example
+```
+
+you can run tests by :
+
+```bash
+# clone repo
+git clone https://github.com/thegeeko/zig-ws && cd zig-ws
+
+# start the server
+zig build run_example
+
+# on another term run tests using autobahn docker image
+docker run -it --rm \
+    -v "$PWD/autobahn/:/config" \
+    -v "$PWD/autobahn/reports:/reports" \
+    --net="host" \
+    --name fuzzingclient \
+    crossbario/autobahn-testsuite wstest -m fuzzingclient -s /config/fuzzingclient.json
+```
+
+## How it works:
+
+it doesn't create http server or handle that for you .. it only takes an allocator and std server Response object eg: 
+
+```zig
 const std = @import("std");
 const Response = std.http.Server.Response;
 
@@ -55,3 +94,4 @@ fn on_binary(msg: []const u8, ws: *WebSocket) void {
     std.log.debug("msg - bin: ({}) {}", .{ msg.len, std.fmt.fmtSliceHexLower(msg) });
     ws.send_binary(msg) catch unreachable;
 }
+```
