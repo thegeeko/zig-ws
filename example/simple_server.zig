@@ -66,6 +66,8 @@ pub fn main() !void {
         };
 
         var ws = try WebSocket.init(allocator, &res);
+        defer ws.deinit();
+
         try ws.handle(ws_events);
     }
 }

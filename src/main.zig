@@ -164,6 +164,8 @@ pub const Opcode = enum(u4) {
     }
 };
 
+/// representation for the websocket header in revers
+/// to account for the network byte order
 const WsFrameHeader = packed struct {
     const Self = @This();
 
@@ -182,6 +184,7 @@ const WsFrameHeader = packed struct {
     const header_size = 2;
     const max_frame_size = mask_size + header_size + @sizeOf(u64);
 
+    /// returns the size bytes count of the payload
     pub fn payload_size_bytes_count(self: *const Self) usize {
         return switch (self.size) {
             0...125 => 0,
@@ -190,8 +193,25 @@ const WsFrameHeader = packed struct {
         };
     }
 
+    /// checks if it's a control frame aka close or ping or pong
+    pub fn is_control(self: *const Self) bool {
+        return switch (self.opcode) {
+            .close, .ping, .pong => true,
+            else => false,
+        };
+    }
+
+    /// check if it's a valid frame rserved bits should be 0
+    /// control frames can't fragmented and should be of size 125 max
     pub fn is_valid(self: *const Self) bool {
-        return (self.rsv3 | self.rsv2 | self.rsv1) == 0;
+        var valid = (self.rsv3 | self.rsv2 | self.rsv1) == 0;
+
+        if (self.is_control()) {
+            valid = valid and self.final;
+            valid = valid and self.size <= 125;
+        }
+
+        return valid;
     }
 
     comptime {
@@ -200,12 +220,7 @@ const WsFrameHeader = packed struct {
     }
 };
 
-const WsFrame = struct {
-    frame_header: WsFrameHeader,
-    mask: [4]u8,
-    data: []const u8,
-};
-
+/// struct to be passed by the user contains the callbacks
 pub const WsEvents = struct {
     /// called whenever a message recived
     on_msg: ?fn ([]const u8, *WebSocket) void = null,
@@ -221,6 +236,7 @@ pub const WsEvents = struct {
     on_pong: ?fn ([]const u8, *WebSocket) void = null,
 };
 
+/// close status .. it doesn't repsent nor respect the user_defined codes treat them all as 3000
 pub const CloseStatus = enum(u16) {
     /// 1000 indicates a normal closure, meaning that the purpose for
     /// which the connection was established has been fulfilled.
@@ -286,6 +302,7 @@ pub const CloseStatus = enum(u16) {
     }
 };
 
+/// the main struct proccess frames and manages fragmentations
 pub const WebSocket = struct {
     const Self = @This();
     const Error = error{
@@ -296,6 +313,9 @@ pub const WebSocket = struct {
     res: *Response,
     stream: *std.net.Stream,
     active: bool = false,
+    frag_buff: std.ArrayList(u8),
+    frag_op: ?Opcode = null,
+    reciving_fragments: bool = false,
 
     /// init the object and checks if the request is a valid handshake request
     /// the request is data is included in the response object
@@ -306,13 +326,19 @@ pub const WebSocket = struct {
             .allocator = allocator,
             .res = res,
             .stream = &res.connection.stream,
+            .frag_buff = std.ArrayList(u8).init(allocator),
         };
 
         return ws;
     }
 
+    pub fn deinit(self: *Self) void {
+        self.frag_buff.deinit();
+    }
+
     /// handle handshaking and proccess data frames
-    /// don't use this inside WsEvents
+    /// don't use this inside WsEvents callbacks
+    /// will handle cleaning the response object and closing the TCP conn
     pub fn handle(self: *Self, comptime events: WsEvents) !void {
         try write_handshake(self.res);
 
@@ -326,54 +352,103 @@ pub const WebSocket = struct {
             var stream_reader = self.stream.reader();
 
             const frame_header = try stream_reader.readStruct(WsFrameHeader);
+
+            // make sure it's valid
             if (!frame_header.is_valid()) {
                 try self.close(.protocol_error, "unvalid header");
                 continue;
             }
 
-            var payload_size: u64 = 0;
-            const payload_size_bytes_count = frame_header.payload_size_bytes_count();
-
-            if (payload_size_bytes_count == 0) {
-                payload_size = frame_header.size;
-            } else {
-                var buf: [@sizeOf(u64)]u8 = undefined;
-                var sized_buf = buf[0..payload_size_bytes_count];
-                _ = try stream_reader.read(sized_buf);
-
-                if (payload_size_bytes_count == @sizeOf(u16)) {
-                    payload_size =
-                        @as(u16, @intCast(sized_buf[1])) | @as(u16, @intCast(sized_buf[0])) << 8;
-                } else {
-                    payload_size =
-                        @as(u64, @intCast(sized_buf[7])) |
-                        @as(u64, @intCast(sized_buf[6])) << 8 |
-                        @as(u64, @intCast(sized_buf[5])) << 16 |
-                        @as(u64, @intCast(sized_buf[4])) << 24 |
-                        @as(u64, @intCast(sized_buf[3])) << 32 |
-                        @as(u64, @intCast(sized_buf[2])) << 40 |
-                        @as(u64, @intCast(sized_buf[1])) << 48 |
-                        @as(u64, @intCast(sized_buf[0])) << 56;
+            // make sure it doesn't recive a non controle frame
+            // until the current fragment ends
+            if (self.reciving_fragments) {
+                if (!frame_header.is_control() and
+                    frame_header.final and frame_header.opcode != .op_continue)
+                {
+                    try self.close(.protocol_error, "invalid fragment");
+                    continue;
                 }
             }
 
+            // reading frame size
+            var frame_payload_size: u64 = 0;
+            const payload_size_bytes_count = frame_header.payload_size_bytes_count();
+
+            if (payload_size_bytes_count == 0) {
+                // defined in header
+                frame_payload_size = frame_header.size;
+            } else {
+                // defined in payload
+                if (payload_size_bytes_count == @sizeOf(u16)) {
+                    var buf: [@sizeOf(u16)]u8 = undefined;
+                    _ = try stream_reader.read(&buf);
+                    frame_payload_size = switch_endian(u16, std.mem.bytesAsValue(u16, &buf).*);
+                } else {
+                    var buf: [@sizeOf(u64)]u8 = undefined;
+                    _ = try stream_reader.read(&buf);
+                    frame_payload_size = switch_endian(u64, std.mem.bytesAsValue(u64, &buf).*);
+                }
+            }
+
+            // reading mask
             var mask: [WsFrameHeader.mask_size]u8 = undefined;
             if (frame_header.masked)
                 _ = try stream_reader.readAtLeast(&mask, WsFrameHeader.mask_size);
 
-            var payload = try self.allocator.alloc(u8, payload_size);
-            defer self.allocator.free(payload);
+            // reading frame payload
+            var frame_payload = try self.allocator.alloc(u8, frame_payload_size);
+            defer self.allocator.free(frame_payload);
 
-            _ = try stream_reader.readAtLeast(payload, payload_size);
+            _ = try stream_reader.readAtLeast(frame_payload, frame_payload_size);
 
+            // unmasking data
             if (frame_header.masked) {
                 // unmasking according to the spec
-                for (0.., payload) |i, char| {
-                    payload[i] = char ^ mask[i % 4];
+                for (0.., frame_payload) |i, char| {
+                    frame_payload[i] = char ^ mask[i % 4];
                 }
             }
 
-            switch (frame_header.opcode) {
+            // handle frags
+            if (!frame_header.final) {
+                if (frame_header.opcode != .op_continue) {
+                    // fragments start
+                    self.frag_buff.clearRetainingCapacity();
+                    self.frag_op = frame_header.opcode;
+                    self.reciving_fragments = true;
+                } else if (!self.reciving_fragments) {
+                    // a continuation without starting a fragments
+                    // should end conn
+                    try self.close(.protocol_error, "nothing to continue");
+                    continue;
+                }
+
+                // appending the fragments
+                try self.frag_buff.appendSlice(frame_payload);
+                continue;
+            }
+
+            // final output after assmpling fragments
+            var opcode: Opcode = undefined;
+            var payload: []u8 = undefined;
+
+            if (frame_header.final == true and frame_header.opcode == .op_continue) {
+                opcode = self.frag_op orelse {
+                    try self.close(.protocol_error, "there's nothing to continue");
+                    continue;
+                };
+
+                // append last payload
+                try self.frag_buff.appendSlice(frame_payload);
+                payload = self.frag_buff.items;
+
+                self.reciving_fragments = false;
+            } else {
+                opcode = frame_header.opcode;
+                payload = frame_payload;
+            }
+
+            switch (opcode) {
                 .text => {
                     if (!std.unicode.utf8ValidateSlice(payload)) {
                         try self.close(.wrong_data_type, "invalid utf-8");
@@ -437,8 +512,11 @@ pub const WebSocket = struct {
                 },
             }
         }
+
+        self.res.deinit();
     }
 
+    /// sending close frame and closing the connection
     pub fn close(self: *Self, status_code: ?CloseStatus, msg: ?[]const u8) !void {
         if (!self.active) return Error.action_without_active_connection;
 
@@ -467,24 +545,28 @@ pub const WebSocket = struct {
         try self.write(.text, msg);
     }
 
+    /// send binary message unmasked
     pub fn send_binary(self: *Self, msg: []const u8) !void {
         if (!self.active) return Error.action_without_active_connection;
 
         try self.write(.binary, msg);
     }
 
+    /// send ping frame
     pub fn ping(self: *Self, msg: []const u8) !void {
         if (!self.active) return Error.action_without_active_connection;
 
         try self.write(.ping, msg);
     }
 
+    /// send pong frame
     pub fn pong(self: *Self, msg: []const u8) !void {
         if (!self.active) return Error.action_without_active_connection;
 
         try self.write(.pong, msg);
     }
 
+    /// internal writes the connection stream
     fn write(self: *Self, opcode: Opcode, payload: []const u8) !void {
         var total_size: usize = 0;
 
@@ -536,8 +618,3 @@ pub const WebSocket = struct {
         _ = try self.stream.writeAll(data_frame);
     }
 };
-
-test "hand shake" {
-    const testing = std.testing;
-    testing.log_level = .debug;
-}
