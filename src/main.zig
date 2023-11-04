@@ -37,6 +37,22 @@ fn remove_whitespace(str: []const u8) []const u8 {
     return str[leading_whitespace .. str.len - trailing_whitespace];
 }
 
+fn switch_endian(comptime T: type, value: T) T {
+    comptime {
+        std.debug.assert(T == u16 or T == u64);
+    }
+
+    if (T == u16) {
+        return (value >> 8) | (value << 8);
+    } else {
+        var swapped_value = value;
+        swapped_value = (swapped_value & 0x00000000ffffffff) << 32 | (swapped_value & 0xffffffff00000000) >> 32;
+        swapped_value = (swapped_value & 0x0000ffff0000ffff) << 16 | (swapped_value & 0xffff0000ffff0000) >> 16;
+        swapped_value = (swapped_value & 0x00ff00ff00ff00ff) << 8 | (swapped_value & 0xff00ff00ff00ff00) >> 8;
+        return swapped_value;
+    }
+}
+
 /// verifies request and make sure it have the needed fileds with the appropriate data
 /// it doesn't care about the origin header cus it's required from browser clients but not
 /// other non-browser clients
@@ -63,7 +79,7 @@ fn is_valid_req(req: *const Request) !void {
         return Error.invalid_http_version;
     }
 
-    // @FIXME should make sure it's a valid URI
+    //  FIXME: should make sure it's a valid URI
     if (!req.headers.contains("Host")) {
         return Error.no_host_header;
     }
@@ -174,6 +190,10 @@ const WsFrameHeader = packed struct {
         };
     }
 
+    pub fn is_valid(self: *const Self) bool {
+        return (self.rsv3 | self.rsv2 | self.rsv1) == 0;
+    }
+
     comptime {
         // making sure the struct is always 2 bytes
         std.debug.assert(@sizeOf(@This()) == 2);
@@ -188,15 +208,82 @@ const WsFrame = struct {
 
 pub const WsEvents = struct {
     /// called whenever a message recived
-    on_msg: ?fn ([]const u8, ws: *WebSocket) void = null,
+    on_msg: ?fn ([]const u8, *WebSocket) void = null,
+    /// called whenever a binary message recived
+    on_binary: ?fn ([]const u8, *WebSocket) void = null,
     /// called after writing the response headers and before sending it
-    on_upgrade: ?fn (res: *Response, ws: *WebSocket) void = null,
+    on_upgrade: ?fn (*Response, *WebSocket) void = null,
     /// called when recived a close frame
-    on_close: ?fn ([]const u8, ws: *WebSocket) void = null,
+    on_close: ?fn (?CloseStatus, ?[]const u8, *WebSocket) void = null,
     /// called when pinged
-    on_ping: ?fn ([]const u8, ws: *WebSocket) void = null,
+    on_ping: ?fn ([]const u8, *WebSocket) void = null,
     /// called when ponged
-    on_pong: ?fn ([]const u8, ws: *WebSocket) void = null,
+    on_pong: ?fn ([]const u8, *WebSocket) void = null,
+};
+
+pub const CloseStatus = enum(u16) {
+    /// 1000 indicates a normal closure, meaning that the purpose for
+    /// which the connection was established has been fulfilled.
+    noraml = 1000,
+
+    /// 1001 indicates that an endpoint is "going away", such as a server
+    /// going down or a browser having navigated away from a page.
+    going_away = 1001,
+
+    /// 1002 indicates that an endpoint is terminating the connection due
+    /// to a protocol error.
+    protocol_error = 1002,
+
+    // 1003 indicates that an endpoint is terminating the connection
+    // because it has received a type of data it cannot accept (e.g., an
+    // endpoint that understands only text data MAY send this if it
+    // receives a binary message).
+    unkown_data_type = 1003,
+
+    /// 1007 indicates that an endpoint is terminating the connection
+    /// because it has received data within a message that was not
+    /// consistent with the type of the message (e.g., non-UTF-8 [RFC3629]
+    /// data within a text message).
+    wrong_data_type = 1007,
+
+    /// 1008 indicates that an endpoint is terminating the connection
+    /// because it has received a message that violates its policy.  This
+    /// is a generic status code that can be returned when there is no
+    /// other more suitable status code (e.g., 1003 or 1009) or if there
+    /// is a need to hide specific details about the policy.
+    policy_violation = 1008,
+
+    /// 1009 indicates that an endpoint is terminating the connection
+    /// because it has received a message that is too big for it to
+    /// process.
+    too_big_message = 1009,
+
+    /// 1010 indicates that an endpoint (client) is terminating the
+    /// connection because it has expected the server to negotiate one or
+    /// more extension, but the server didn't return them in the response
+    /// message of the WebSocket handshake.  The list of extensions that
+    /// are needed SHOULD appear in the /reason/ part of the Close frame.
+    /// Note that this status code is not used by the server, because it
+    /// can fail the WebSocket handshake instead.
+    requested_ext_not_avaliable = 1010,
+
+    /// 1011 indicates that a server is terminating the connection because
+    /// it encountered an unexpected condition that prevented it from
+    /// fulfilling the request.
+    unexpected_condition = 1011,
+
+    //  FIXME: should respect the status code,
+    // currently it's always 3000 it should be a range from 3000-4999
+    /// defined by the user 3000 - 4999
+    other = 3000,
+
+    pub fn from_int(int: u16) !CloseStatus {
+        return switch (int) {
+            1000...1003, 1007...1011 => @enumFromInt(int),
+            3000...4999 => CloseStatus.other,
+            else => error.unkown_int,
+        };
+    }
 };
 
 pub const WebSocket = struct {
@@ -213,7 +300,7 @@ pub const WebSocket = struct {
     /// init the object and checks if the request is a valid handshake request
     /// the request is data is included in the response object
     pub fn init(allocator: std.mem.Allocator, res: *Response) !Self {
-        try is_valid_req(&res.request);
+        // try is_valid_req(&res.request);
 
         var ws = Self{
             .allocator = allocator,
@@ -239,6 +326,10 @@ pub const WebSocket = struct {
             var stream_reader = self.stream.reader();
 
             const frame_header = try stream_reader.readStruct(WsFrameHeader);
+            if (!frame_header.is_valid()) {
+                try self.close(.protocol_error, "unvalid header");
+                continue;
+            }
 
             var payload_size: u64 = 0;
             const payload_size_bytes_count = frame_header.payload_size_bytes_count();
@@ -283,15 +374,53 @@ pub const WebSocket = struct {
             }
 
             switch (frame_header.opcode) {
-                .text, .binary => {
+                .text => {
+                    if (!std.unicode.utf8ValidateSlice(payload)) {
+                        try self.close(.wrong_data_type, "invalid utf-8");
+                        continue;
+                    }
+
                     if (events.on_msg) |on_msg|
                         on_msg(payload, self);
                 },
+                .binary => {
+                    if (events.on_binary) |on_binary|
+                        on_binary(payload, self);
+                },
                 .close => {
-                    if (events.on_close) |on_close|
-                        on_close(payload, self);
+                    if (payload.len == 0) {
+                        if (events.on_close) |on_close|
+                            on_close(null, null, self);
 
-                    try self.close(payload);
+                        try self.close(null, null);
+                        continue;
+                    }
+
+                    if (payload.len < @sizeOf(u16)) {
+                        try self.close(.protocol_error, "payload w/o status code");
+                        continue;
+                    }
+
+                    if (!std.unicode.utf8ValidateSlice(payload[2..])) {
+                        try self.close(.protocol_error, "invalid utf-8, close frames payload must be valid utf-8");
+                        continue;
+                    }
+
+                    var status_raw = std.mem.bytesAsValue(u16, payload[0..@sizeOf(u16)]).*;
+                    status_raw = switch_endian(u16, status_raw);
+                    var status_code = CloseStatus.from_int(status_raw) catch {
+                        try self.close(.protocol_error, "invalid status code");
+                        continue;
+                    };
+
+                    // FIXME: defaulting to normal status code when recived application status code
+                    if (status_code == .other) status_code = .noraml;
+
+                    var msg = payload[@sizeOf(u16)..];
+                    if (events.on_close) |on_close|
+                        on_close(status_code, msg, self);
+
+                    try self.close(status_code, msg);
                 },
                 .ping => {
                     try self.pong(payload);
@@ -304,16 +433,30 @@ pub const WebSocket = struct {
                         on_pong(payload, self);
                 },
                 else => {
-                    @panic("unimplemented opcode");
+                    try self.close(.protocol_error, "unkown_opcode");
                 },
             }
         }
     }
 
-    pub fn close(self: *Self, msg: []const u8) !void {
+    pub fn close(self: *Self, status_code: ?CloseStatus, msg: ?[]const u8) !void {
         if (!self.active) return Error.action_without_active_connection;
 
-        try self.write(.close, msg);
+        if (msg) |msg_unwrapped| {
+            var status_code_unwrapped = status_code orelse return error.message_without_status_code;
+
+            var sent_message = try self.allocator.alloc(u8, msg_unwrapped.len + @sizeOf(CloseStatus));
+            defer self.allocator.free(sent_message);
+
+            var status_code_num = switch_endian(u16, @intFromEnum(status_code_unwrapped));
+            @memcpy(sent_message[0..@sizeOf(u16)], std.mem.asBytes(&status_code_num));
+            @memcpy(sent_message[@sizeOf(u16)..], msg_unwrapped);
+
+            try self.write(.close, sent_message);
+        } else {
+            try self.write(.close, "");
+        }
+
         self.active = false;
     }
 
@@ -322,6 +465,12 @@ pub const WebSocket = struct {
         if (!self.active) return Error.action_without_active_connection;
 
         try self.write(.text, msg);
+    }
+
+    pub fn send_binary(self: *Self, msg: []const u8) !void {
+        if (!self.active) return Error.action_without_active_connection;
+
+        try self.write(.binary, msg);
     }
 
     pub fn ping(self: *Self, msg: []const u8) !void {
@@ -366,7 +515,7 @@ pub const WebSocket = struct {
         if (payload_size_bytes == @sizeOf(u16)) {
             const size: u16 = @truncate(payload.len);
             // swap endiannes for the network
-            const swapped_size = (size >> 8) | (size << 8);
+            const swapped_size = switch_endian(u16, size);
             @memcpy(
                 data_frame[i .. i + @sizeOf(u16)],
                 std.mem.asBytes(&swapped_size),
@@ -375,10 +524,7 @@ pub const WebSocket = struct {
         } else if (payload_size_bytes == @sizeOf(u64)) {
             const size: u64 = @truncate(payload.len);
             // swap endiannes for the network
-            var swapped_size = size;
-            swapped_size = (swapped_size & 0x00000000ffffffff) << 32 | (swapped_size & 0xffffffff00000000) >> 32;
-            swapped_size = (swapped_size & 0x0000ffff0000ffff) << 16 | (swapped_size & 0xffff0000ffff0000) >> 16;
-            swapped_size = (swapped_size & 0x00ff00ff00ff00ff) << 8 | (swapped_size & 0xff00ff00ff00ff00) >> 8;
+            const swapped_size = switch_endian(u64, size);
             @memcpy(
                 data_frame[WsFrameHeader.header_size .. WsFrameHeader.header_size + @sizeOf(u64)],
                 std.mem.asBytes(&swapped_size),

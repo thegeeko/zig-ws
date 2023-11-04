@@ -2,11 +2,26 @@ const std = @import("std");
 const Response = std.http.Server.Response;
 const WsEvents = @import("ws").WsEvents;
 const WebSocket = @import("ws").WebSocket;
+const CloseStatus = @import("ws").CloseStatus;
 
 fn on_msg(msg: []const u8, ws: *WebSocket) void {
-    std.log.debug("msg: ({}):{s}", .{ msg.len, msg });
+    std.log.debug("msg: ({})", .{msg.len});
     ws.send(msg) catch unreachable;
-    ws.ping("test") catch unreachable;
+}
+
+fn on_binary(msg: []const u8, ws: *WebSocket) void {
+    std.log.debug("msg - bin: ({})", .{msg.len});
+    ws.send_binary(msg) catch unreachable;
+}
+
+fn on_close(status_code: ?CloseStatus, msg: ?[]const u8, ws: *WebSocket) void {
+    _ = ws;
+    if (status_code) |code| {
+        const msg_unwrapped = msg orelse "no_msg";
+        std.log.debug("close: ({}), {s}", .{ code, msg_unwrapped });
+    } else {
+        std.log.debug("close w/o msg", .{});
+    }
 }
 
 pub fn main() !void {
@@ -19,6 +34,13 @@ pub fn main() !void {
         }
     }
 
+    // avoid heap allocations for better performace but limited
+    // message size .. can be useful if u will only do small messages
+    //
+    // var buf: [1024]u8 = undefined;
+    // var fba = std.heap.FixedBufferAllocator.init(&buf);
+    // const allocator = fba.allocator();
+
     var server = std.http.Server.init(allocator, .{ .reuse_address = true });
     defer server.deinit();
 
@@ -28,26 +50,22 @@ pub fn main() !void {
 
     const ws_events = WsEvents{
         .on_msg = on_msg,
+        .on_binary = on_binary,
+        .on_close = on_close,
     };
 
-    outer: while (true) {
+    while (true) {
         var res = try server.accept(.{ .allocator = allocator });
         defer res.deinit();
 
-        while (res.reset() != .closing) {
-            res.wait() catch |err| switch (err) {
-                error.HttpHeadersInvalid => continue :outer,
-                error.EndOfStream => continue,
-                else => return err,
-            };
+        res.wait() catch |err| switch (err) {
+            error.HttpHeadersInvalid => continue,
+            error.ConnectionResetByPeer => continue,
+            error.EndOfStream => continue,
+            else => return err,
+        };
 
-            var ws = try WebSocket.init(allocator, &res);
-            // remember to reset the request after this returns
-            // the spec states that the tcp connection must be closed
-            try ws.handle(ws_events);
-
-            // close server after websocket connection close
-            // break :outer;
-        }
+        var ws = try WebSocket.init(allocator, &res);
+        try ws.handle(ws_events);
     }
 }
